@@ -1036,6 +1036,14 @@ impl<'d, P: PacketPool> ConnectionManager<'d, P> {
         self.security_manager.poll_events()
     }
 
+    /// LOCAL PATCH: whether an in-progress pairing's deadline has genuinely elapsed (see
+    /// `SecurityManager::is_timed_out`). Used by the control runner to ignore a stale poll-deadline
+    /// wake caused by a lost `TimerChange` re-arm.
+    #[cfg(feature = "security")]
+    pub(crate) fn security_timed_out(&self) -> bool {
+        self.security_manager.is_timed_out()
+    }
+
     #[cfg(feature = "connection-metrics")]
     pub(crate) fn metrics<F: FnOnce(&Metrics) -> R, R>(&self, index: u8, f: F) -> R {
         f(&self.connection(index).metrics)

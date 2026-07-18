@@ -1928,8 +1928,26 @@ impl<'d, C: Controller, P: PacketPool> ControlRunner<'d, C, P> {
                 Either5::Fourth(request) => {
                     #[cfg(feature = "security")]
                     {
-                        let event_data = request.unwrap_or(SecurityEventData::Timeout);
-                        host.state.connections.handle_security_event(host, event_data).await?;
+                        match request {
+                            Ok(event_data) => {
+                                host.state.connections.handle_security_event(host, event_data).await?;
+                            }
+                            // LOCAL PATCH: the poll deadline elapsed, but `reset_timeout` may have
+                            // pushed it forward after this poll captured its snapshot (the
+                            // `TimerChange` re-arm is best-effort and can be dropped). Only treat it
+                            // as a real timeout if the *current* deadline has truly passed;
+                            // otherwise fall through and re-poll with the fresh deadline. This turns
+                            // a lost re-arm into a harmless re-poll instead of a spurious pairing
+                            // timeout mid-handshake.
+                            Err(_timeout) => {
+                                if host.state.connections.security_timed_out() {
+                                    host.state
+                                        .connections
+                                        .handle_security_event(host, SecurityEventData::Timeout)
+                                        .await?;
+                                }
+                            }
+                        }
                     }
                 }
                 Either5::Fifth(()) => {

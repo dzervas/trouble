@@ -253,7 +253,7 @@ impl Inner {
     fn handle_peripheral<P: PacketPool>(
         &mut self,
         bonds: &mut VecView<BondInformation>,
-        events: &Channel<NoopRawMutex, SecurityEventData, 3>,
+        events: &Channel<NoopRawMutex, SecurityEventData, 8>,
         cmd: &SmpCommand<'_>,
         connections: &ConnectionManager<'_, P>,
         storage: &ConnectionStorage<P::Packet>,
@@ -344,7 +344,7 @@ impl Inner {
     fn handle_central<P: PacketPool>(
         &mut self,
         bonds: &mut VecView<BondInformation>,
-        events: &Channel<NoopRawMutex, SecurityEventData, 3>,
+        events: &Channel<NoopRawMutex, SecurityEventData, 8>,
         cmd: &SmpCommand<'_>,
         connections: &ConnectionManager<'_, P>,
         storage: &ConnectionStorage<P::Packet>,
@@ -411,7 +411,7 @@ impl Inner {
     fn handle_pairing_event<P: PacketPool>(
         &mut self,
         bonds: &mut VecView<BondInformation>,
-        events: &Channel<NoopRawMutex, SecurityEventData, 3>,
+        events: &Channel<NoopRawMutex, SecurityEventData, 8>,
         pairing_event: pairing::Event,
         connections: &ConnectionManager<'_, P>,
         storage: &ConnectionStorage<P::Packet>,
@@ -442,13 +442,21 @@ impl Inner {
     fn handle_encryption_success<P: PacketPool>(
         &mut self,
         bonds: &mut VecView<BondInformation>,
-        events: &Channel<NoopRawMutex, SecurityEventData, 3>,
+        events: &Channel<NoopRawMutex, SecurityEventData, 8>,
         encrypted: bool,
         connections: &ConnectionManager<'_, P>,
         storage: &mut ConnectionStorage<P::Packet>,
     ) -> Result<(), Error> {
         let mut bond = None;
-        let res: Result<(), Error> = if let Some(sm) = Self::pairing_sm_for(self.pairing_sm.as_mut(), storage) {
+        // LOCAL PATCH: only drive the pairing SM if it is still in progress. A spurious SMP timeout
+        // can move the SM to a terminal state (Error(Timeout)) while a *successful* EncryptionChange
+        // is still in flight; feeding LinkEncryptedResult to a finished SM hits the FSM catch-all
+        // `_ => Err(InvalidState)`, which propagates out of Runner::run and panics the whole host.
+        // Routing a late/post-timeout encryption event to the bonded-resume branch below instead
+        // keeps the link (the bond was already stored in try_enable_encryption).
+        let res: Result<(), Error> = if let Some(sm) =
+            Self::pairing_sm_for(self.pairing_sm.as_mut(), storage).filter(|sm| sm.result().is_none())
+        {
             let mut ops = PairingOpsImpl {
                 bonds,
                 events,
@@ -514,7 +522,7 @@ impl Inner {
     fn handle_encryption_failure<P: PacketPool>(
         &mut self,
         bonds: &mut VecView<BondInformation>,
-        events: &Channel<NoopRawMutex, SecurityEventData, 3>,
+        events: &Channel<NoopRawMutex, SecurityEventData, 8>,
         connections: &ConnectionManager<'_, P>,
         storage: &mut ConnectionStorage<P::Packet>,
     ) {
@@ -557,7 +565,7 @@ impl Inner {
     fn initiate<P: PacketPool>(
         &mut self,
         bonds: &mut VecView<BondInformation>,
-        events: &Channel<NoopRawMutex, SecurityEventData, 3>,
+        events: &Channel<NoopRawMutex, SecurityEventData, 8>,
         connections: &ConnectionManager<'_, P>,
         storage: &ConnectionStorage<<P as PacketPool>::Packet>,
         user_initiated: bool,
@@ -616,8 +624,16 @@ pub struct SecurityManager<'d> {
     inner: RefCell<Inner>,
     /// Bond storage (externally owned by HostResources)
     bonds: &'d RefCell<VecView<BondInformation>>,
-    /// Received events
-    events: Channel<NoopRawMutex, SecurityEventData, 3>,
+    /// Received events.
+    ///
+    /// LOCAL PATCH: capacity raised from 3 to 8. `reset_timeout` re-arms the SMP deadline by
+    /// best-effort `try_send(TimerChange)`; if that is dropped on a full channel the control runner
+    /// keeps sleeping on a stale (shorter) deadline and fires a spurious "Pairing timeout"
+    /// mid-handshake (worsened by radio power-save latency and the human delay pressing the
+    /// numeric-comparison confirm key). During confirm -> DHKey -> enable-encryption several events
+    /// (TimerChange + EnableEncryption + TimerChange) burst at once; the extra slack keeps the
+    /// re-arm from being lost so pairing completes normally (and emits PairingComplete).
+    events: Channel<NoopRawMutex, SecurityEventData, 8>,
 }
 
 impl<'d> SecurityManager<'d> {
@@ -677,6 +693,20 @@ impl<'d> SecurityManager<'d> {
         let inner = self.inner.borrow();
         match &inner.pairing_sm {
             Some(sm) => sm.peer_address() == address && sm.result().is_none(),
+            None => false,
+        }
+    }
+
+    /// LOCAL PATCH: true only if a pairing is in progress AND its deadline has *genuinely* elapsed.
+    /// The SMP deadline is re-armed by a best-effort `TimerChange` (dropped on a full events
+    /// channel); when that is lost the control runner sleeps on a stale deadline and wakes early.
+    /// The runner re-checks this on a deadline wake, so a lost re-arm self-heals into a re-poll
+    /// instead of a spurious "Pairing timeout" that (post `reset_timeout`) would otherwise abort a
+    /// pairing that is actually still progressing.
+    pub(crate) fn is_timed_out(&self) -> bool {
+        let inner = self.inner.borrow();
+        match &inner.pairing_sm {
+            Some(sm) => sm.result().is_none() && Instant::now() >= sm.timeout_at(),
             None => false,
         }
     }
@@ -1157,7 +1187,7 @@ impl<'d> SecurityManager<'d> {
 
 struct PairingOpsImpl<'sm, 'cm, 'cm2, 'cs, P: PacketPool> {
     bonds: &'sm mut VecView<BondInformation>,
-    events: &'sm Channel<NoopRawMutex, SecurityEventData, 3>,
+    events: &'sm Channel<NoopRawMutex, SecurityEventData, 8>,
     secret_key: &'sm crypto::SecretKey,
     public_key: &'sm crypto::PublicKey,
     connections: &'cm ConnectionManager<'cm2, P>,
@@ -1346,7 +1376,7 @@ mod tests {
             SecurityLevel::EncryptedAuthenticated,
             true,
         )));
-        let events = Channel::<NoopRawMutex, SecurityEventData, 3>::new();
+        let events = Channel::<NoopRawMutex, SecurityEventData, 8>::new();
 
         unwrap!(mgr.with_connected_handle(handle, |storage| {
             unwrap!(inner.handle_encryption_success(&mut bonds, &events, true, mgr, storage));
@@ -1373,7 +1403,7 @@ mod tests {
             SecurityLevel::Encrypted,
             true,
         )));
-        let events = Channel::<NoopRawMutex, SecurityEventData, 3>::new();
+        let events = Channel::<NoopRawMutex, SecurityEventData, 8>::new();
 
         unwrap!(mgr.with_connected_handle(handle, |storage| {
             inner.handle_encryption_failure(&mut bonds, &events, mgr, storage);
@@ -1394,7 +1424,7 @@ mod tests {
 
         let mut inner = test_inner(other);
         let mut bonds: heapless::Vec<BondInformation, 4> = heapless::Vec::new();
-        let events = Channel::<NoopRawMutex, SecurityEventData, 3>::new();
+        let events = Channel::<NoopRawMutex, SecurityEventData, 8>::new();
 
         unwrap!(mgr.with_connected_handle(handle, |storage| {
             assert_eq!(
